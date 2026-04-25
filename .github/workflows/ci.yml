@@ -1,0 +1,218 @@
+name: CI / Grader
+
+on:
+  push:
+    branches-ignore:
+      - main
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      # ── Métrica: config_file_valid_schema ─────────────────────────────────
+      - name: Validate compose.test.yml
+        id: compose_valid
+        run: |
+          if [ ! -f starter-code/compose.test.yml ]; then
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ compose.test.yml not found — did you create it from compose.test.yml.example?"
+            exit 0
+          fi
+
+          if python3 -c "
+          import yaml, sys
+          with open('starter-code/compose.test.yml') as f:
+              data = yaml.safe_load(f)
+          services = data.get('services', {})
+          has_postgres = any('postgres' in str(svc.get('image', '')) for svc in services.values())
+          if not has_postgres:
+              print('No official postgres image found', file=sys.stderr)
+              sys.exit(1)
+          print('Valid')
+          " 2>&1; then
+            echo "score=1.0" >> "$GITHUB_OUTPUT"
+            echo "passed=true" >> "$GITHUB_OUTPUT"
+            echo "✅ compose.test.yml is valid with official postgres image"
+          else
+            echo "score=0.0" >> "$GITHUB_OUTPUT"
+            echo "passed=false" >> "$GITHUB_OUTPUT"
+            echo "❌ compose.test.yml is invalid or missing official postgres image"
+          fi
+
+      # ── Start PostgreSQL via student's compose ────────────────────────────
+      - name: Start test database
+        id: db_start
+        if: steps.compose_valid.outputs.passed == 'true'
+        run: |
+          cd starter-code
+          docker compose -f compose.test.yml up -d
+          echo "Waiting for PostgreSQL..."
+          for i in $(seq 1 30); do
+            if docker compose -f compose.test.yml exec -T postgres-test \
+                pg_isready -q 2>/dev/null; then
+              echo "✅ PostgreSQL is ready"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "❌ PostgreSQL did not become ready in time"
+          exit 1
+
+      # ── Setup Node.js ─────────────────────────────────────────────────────
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: starter-code/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --prefix starter-code
+
+      # ── Run migrations ─────────────────────────────────────────────────────
+      - name: Run migrations
+        if: steps.compose_valid.outputs.passed == 'true'
+        run: |
+          cd starter-code
+          if [ -f .env.test ]; then
+            set -a && source .env.test && set +a
+          fi
+          PGPASSWORD="${DB_PASSWORD:-postgres}" psql \
+            -h "${DB_HOST:-localhost}" \
+            -p "${DB_PORT:-5433}" \
+            -U "${DB_USER:-postgres}" \
+            -d "${DB_NAME:-testdb}" \
+            -f src/migrations/001_init.sql
+
+      # ── Métrica: test_pass_rate + test_coverage + integration_test_count ──
+      - name: Run tests with coverage
+        id: test_run
+        if: steps.compose_valid.outputs.passed == 'true'
+        run: |
+          cd starter-code
+          npm run test:coverage -- --json --outputFile=test-results.json 2>&1 || true
+
+          # Count test blocks inside tests/integration/
+          INT_COUNT=0
+          for f in tests/integration/*.test.ts; do
+            [ -f "$f" ] || continue
+            COUNT=$(grep -cE "^\s*(it|test)\(" "$f" 2>/dev/null || echo 0)
+            INT_COUNT=$((INT_COUNT + COUNT))
+          done
+          echo "integration_test_count=$INT_COUNT" >> "$GITHUB_OUTPUT"
+          echo "Integration tests found: $INT_COUNT"
+
+          # Parse test results
+          if [ -f test-results.json ]; then
+            TOTAL=$(node -p "require('./test-results.json').numTotalTests || 0")
+            PASSED=$(node -p "require('./test-results.json').numPassedTests || 0")
+            PASS_RATE=$(python3 -c "
+            total, passed = $TOTAL, $PASSED
+            print(f'{(passed/total):.2f}' if total > 0 else '0.0')
+            ")
+          else
+            PASS_RATE="0.0"
+          fi
+          echo "test_pass_rate=$PASS_RATE" >> "$GITHUB_OUTPUT"
+          echo "Pass rate: $PASS_RATE"
+
+          # Parse coverage
+          if [ -f coverage/coverage-summary.json ]; then
+            COVERAGE=$(node -p "
+              const c = require('./coverage/coverage-summary.json').total;
+              ((c.lines.pct + c.statements.pct) / 2 / 100).toFixed(2);
+            ")
+          else
+            COVERAGE="0.0"
+          fi
+          echo "coverage=$COVERAGE" >> "$GITHUB_OUTPUT"
+          echo "Coverage: $COVERAGE"
+
+      # ── Teardown ───────────────────────────────────────────────────────────
+      - name: Stop test database
+        if: always() && steps.compose_valid.outputs.passed == 'true'
+        run: |
+          cd starter-code
+          docker compose -f compose.test.yml down -v
+
+      # ── Reporte final ─────────────────────────────────────────────────────
+      - name: Build grader report
+        if: always()
+        run: |
+          COMPOSE_VALID="${{ steps.compose_valid.outputs.passed || 'false' }}"
+          TEST_PASS_RATE="${{ steps.test_run.outputs.test_pass_rate || '0.0' }}"
+          COVERAGE="${{ steps.test_run.outputs.coverage || '0.0' }}"
+          INT_COUNT="${{ steps.test_run.outputs.integration_test_count || '0' }}"
+
+          INT_SCORE=$(python3 -c "c=int('$INT_COUNT'); print(f'{min(c/8,1.0):.2f}')")
+          INT_PASSED=$(python3 -c "print('true' if int('$INT_COUNT') >= 8 else 'false')")
+          COV_PASSED=$(python3 -c "print('true' if float('$COVERAGE') >= 0.75 else 'false')")
+          PASS_PASSED=$(python3 -c "print('true' if float('$TEST_PASS_RATE') >= 1.0 else 'false')")
+          CI_SCORE=$(python3 -c "
+          compose = '$COMPOSE_VALID' == 'true'
+          passing = float('$TEST_PASS_RATE') >= 1.0
+          print('1.0' if compose and passing else '0.0')
+          ")
+          CI_PASSED=$(python3 -c "
+          print('true' if '$COMPOSE_VALID'=='true' and float('$TEST_PASS_RATE')>=1.0 else 'false')
+          ")
+
+          cat > grader-report.json << EOF
+          {
+            "schemaVersion": "1.0",
+            "templateSlug": "gpi-integration-testing-db",
+            "runId": "${{ github.run_id }}",
+            "sha": "${{ github.sha }}",
+            "metrics": [
+              {
+                "metricKey": "test_coverage",
+                "score": $COVERAGE,
+                "passed": $COV_PASSED,
+                "unavailable": false
+              },
+              {
+                "metricKey": "test_pass_rate",
+                "score": $TEST_PASS_RATE,
+                "passed": $PASS_PASSED,
+                "unavailable": false
+              },
+              {
+                "metricKey": "integration_test_count",
+                "score": $INT_SCORE,
+                "passed": $INT_PASSED,
+                "unavailable": false
+              },
+              {
+                "metricKey": "ci_pipeline_passes",
+                "score": $CI_SCORE,
+                "passed": $CI_PASSED,
+                "unavailable": false
+              },
+              {
+                "metricKey": "config_file_valid_schema",
+                "score": $([ "$COMPOSE_VALID" = "true" ] && echo "1.0" || echo "0.0"),
+                "passed": $COMPOSE_VALID,
+                "unavailable": false
+              }
+            ]
+          }
+          EOF
+          cat grader-report.json
+
+      - name: Upload grader report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: grader-report
+          path: grader-report.json

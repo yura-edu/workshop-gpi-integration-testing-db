@@ -1,0 +1,16 @@
+# Rename this file to compose.test.yml and replace each ____ with real values.
+# Use port 5433 on the host to avoid conflicts with a local PostgreSQL on 5432.
+services:
+  postgres-test:
+    image: postgres:16-alpine
+    ports:
+      - "____:5432"            # Replace ____  e.g. "5433:5432"
+    environment:
+      POSTGRES_DB:       ____  # e.g. testdb
+      POSTGRES_USER:     ____  # e.g. postgres
+      POSTGRES_PASSWORD: ____  # e.g. postgres
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 10

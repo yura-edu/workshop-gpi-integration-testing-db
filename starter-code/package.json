@@ -1,0 +1,21 @@
+{
+  "name": "workshop-gpi-integration-testing-db",
+  "version": "1.0.0",
+  "description": "Starter code for the Integration Testing with Real DB workshop",
+  "scripts": {
+    "test": "jest --forceExit",
+    "test:coverage": "jest --coverage --forceExit",
+    "test:integration": "jest --testPathPattern=tests/integration --forceExit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "pg": "^8.11.10"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "@types/pg": "^8.11.6",
+    "jest": "^29.7.0",
+    "ts-jest": "^29.2.3",
+    "typescript": "^5.5.3"
+  }
+}
